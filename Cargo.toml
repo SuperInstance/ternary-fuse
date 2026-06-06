@@ -5,3 +5,6 @@ edition = "2021"
 description = "Operator fusion for ternary networks — compose operations to eliminate memory round-trips"
 license = "MIT"
 repository = "https://github.com/SuperInstance/ternary-fuse"
+
+[dependencies]
+ternary-types = { git = "https://github.com/SuperInstance/ternary-types.git", features = ["std"] }

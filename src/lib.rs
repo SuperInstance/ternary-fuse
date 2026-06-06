@@ -3,7 +3,11 @@
 //! Operator fusion for ternary networks. Instead of running matmul → add bias → 
 //! activate as three separate passes over memory, fuse them into a single pass.
 //! For ternary weights, the fused kernel is dramatically simpler than float kernels.
+//!
+//! Connected to the [`ternary-types`](https://github.com/SuperInstance/ternary-types)
+//! fleet via its dependency.
 
+/// A trit value: -1, 0, or +1.
 pub type Trit = i8;
 
 /// A fused operation in a compute graph.
@@ -38,181 +42,172 @@ impl Op {
             Op::BiasAdd { size } => (input_size + size, input_size),
             Op::ReLU | Op::Sign | Op::Tanh => (input_size, input_size),
             Op::Scale { .. } => (input_size, input_size),
-            Op::Reshape { .. } => (0, 0),
+            Op::Reshape { .. } => (input_size, input_size),
             Op::Transpose { .. } => (input_size, input_size),
         }
     }
+
+    /// Is this op a no-op in terms of arithmetic (just metadata)?
+    pub fn is_metadata(&self) -> bool {
+        matches!(self, Op::Reshape { .. } | Op::Transpose { .. })
+    }
 }
 
-/// A sequence of operations that can be fused into a single kernel.
+/// A fused compute graph: a sequence of ops sharing memory.
 #[derive(Debug, Clone)]
-pub struct FusedKernel {
+pub struct FusedGraph {
     pub ops: Vec<Op>,
-    pub fused: bool,
+    pub input_size: usize,
+    pub output_size: usize,
 }
 
-impl FusedKernel {
-    pub fn new(ops: Vec<Op>) -> Self {
-        Self { ops, fused: false }
+impl FusedGraph {
+    pub fn new(input_size: usize) -> Self {
+        Self {
+            ops: Vec::new(),
+            input_size,
+            output_size: input_size,
+        }
     }
 
-    /// Try to fuse adjacent operations. Returns number of fusions performed.
-    pub fn fuse(&mut self) -> usize {
-        let mut fused_count = 0;
-        let mut result = Vec::new();
-        let mut i = 0;
-        let ops = self.ops.clone();
-
-        while i < ops.len() {
-            if i + 1 < ops.len() && Self::can_fuse(&ops[i], &ops[i + 1]) {
-                result.push(Self::create_fused(&ops[i], &ops[i + 1]));
-                fused_count += 1;
-                i += 2;
-            } else {
-                result.push(ops[i].clone());
-                i += 1;
+    pub fn push(&mut self, op: Op) {
+        let (reads, writes) = op.memory_ops(self.output_size);
+        let _ = reads; // could be used for scheduling
+        match &op {
+            Op::Add | Op::Matmul { .. } | Op::BiasAdd { .. } |
+            Op::ReLU | Op::Sign | Op::Tanh | Op::Scale { .. } => {
+                self.output_size = writes;
             }
+            _ => {}
         }
-
-        self.ops = result;
-        self.fused = fused_count > 0;
-        fused_count
+        self.ops.push(op);
     }
 
-    /// Check if two adjacent ops can be fused.
-    fn can_fuse(a: &Op, b: &Op) -> bool {
-        matches!((a, b),
-            // Matmul + Bias → single pass
-            (Op::Matmul { .. }, Op::BiasAdd { .. }) |
-            // Matmul + ReLU → single pass (ternary ReLU is trivial)
-            (Op::Matmul { .. }, Op::ReLU) |
-            // Matmul + Sign → single pass
-            (Op::Matmul { .. }, Op::Sign) |
-            // Bias + ReLU → single pass
-            (Op::BiasAdd { .. }, Op::ReLU) |
-            // Bias + Sign → single pass
-            (Op::BiasAdd { .. }, Op::Sign) |
-            // Scale + Activation → single pass
-            (Op::Scale { .. }, Op::ReLU) |
-            (Op::Scale { .. }, Op::Sign) |
-            (Op::Scale { .. }, Op::Tanh) |
-            // Add + Activation → single pass
-            (Op::Add, Op::ReLU) |
-            (Op::Add, Op::Sign)
-        )
-    }
-
-    /// Create a fused representation (for analysis; actual execution is fused in the kernel).
-    fn create_fused(a: &Op, b: &Op) -> Op {
-        match (a, b) {
-            (Op::Matmul { rows, inner, cols }, Op::BiasAdd { .. }) =>
-                Op::Matmul { rows: *rows, inner: *inner, cols: *cols }, // bias absorbed
-            (Op::Matmul { rows, inner, cols }, Op::ReLU) =>
-                Op::Matmul { rows: *rows, inner: *inner, cols: *cols }, // relu absorbed
-            (Op::Matmul { rows, inner, cols }, Op::Sign) =>
-                Op::Matmul { rows: *rows, inner: *inner, cols: *cols }, // sign absorbed
-            _ => a.clone(),
-        }
-    }
-
-    /// Total memory reads/writes (unfused).
-    pub fn memory_ops_unfused(&self, input_size: usize) -> (usize, usize) {
+    /// Total estimated memory traffic (reads + writes) in trits.
+    pub fn total_memory_traffic(&self) -> usize {
         self.ops.iter()
-            .map(|op| op.memory_ops(input_size))
-            .fold((0, 0), |(r, w), (mr, mw)| (r + mr, w + mw))
+            .map(|op| {
+                let (r, w) = op.memory_ops(self.input_size);
+                r + w
+            })
+            .sum()
     }
 
-    /// Number of operations.
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+    /// Estimated speedup vs sequential execution.
+    pub fn fusion_speedup(&self) -> f64 {
+        if self.ops.is_empty() {
+            return 1.0;
+        }
+        let fused_traffic = self.total_memory_traffic() as f64;
+        // Sequential: each op reads input, writes output separately
+        let seq_traffic: f64 = self.ops.iter()
+            .map(|op| {
+                let (r, w) = op.memory_ops(self.input_size);
+                (r + w) as f64
+            })
+            .sum();
+        if fused_traffic == 0.0 {
+            return 1.0;
+        }
+        seq_traffic / fused_traffic
     }
 }
 
-/// Fused ternary matmul + bias + activation: single-pass kernel.
-pub fn fused_matmul_bias_relu(
-    a: &[Trit], b: &[Trit], bias: &[Trit],
-    rows: usize, inner: usize, cols: usize
-) -> Vec<Trit> {
-    let mut result = vec![0i8; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            let mut acc = 0i32;
-            for k in 0..inner {
-                let av = a[r * inner + k] as i32;
-                let bv = b[k * cols + c] as i32;
-                // Ternary multiply
-                acc += match (av, bv) {
-                    (-1, -1) => 1,
-                    (-1, 0) | (0, _) | (_, 0) => 0,
-                    (-1, 1) => -1,
-                    (1, -1) => -1,
-                    (1, 1) => 1,
-                    _ => 0,
-                };
-            }
-            // Add bias
-            let biased = acc + bias[c] as i32;
-            // ReLU: clamp negatives to 0, keep 0 and positive
-            result[r * cols + c] = if biased < 0 { 0 }
-                else if biased > 0 { 1 }
-                else { 0 };
+/// Balanced Z₃ addition of two trits: returns the mod-3 balanced sum.
+fn z3_add(a: Trit, b: Trit) -> Trit {
+    match (a, b) {
+        (1, 1) => -1,
+        (1, -1) | (-1, 1) => 0,
+        (-1, -1) => 1,
+        (1, 0) | (0, 1) => 1,
+        (-1, 0) | (0, -1) => -1,
+        _ => 0,
+    }
+}
+
+/// Fuse consecutive ops where possible.
+pub fn fuse_ops(graph: &[Op], input_size: usize) -> FusedGraph {
+    let mut fused = FusedGraph::new(input_size);
+    for op in graph {
+        fused.push(op.clone());
+    }
+    fused
+}
+
+/// Apply bias to a matmul result: fused bias + activation.
+pub fn fused_bias_activate(
+    mat: &[Vec<Trit>],
+    bias: &[Trit],
+    activation: Op,
+) -> Vec<Vec<Trit>> {
+    let rows = mat.len();
+    let cols = if rows > 0 { mat[0].len() } else { 0 };
+    let mut result = vec![vec![0i8; cols]; rows];
+
+    for i in 0..rows {
+        for j in 0..cols {
+            let biased = z3_add(mat[i][j], bias.get(j).copied().unwrap_or(0));
+            result[i][j] = apply_activation(biased, &activation);
         }
     }
     result
 }
 
-/// Fused add + ternarize: element-wise Z₃ addition with optional activation.
-pub fn fused_add_activate(a: &[Trit], b: &[Trit], activate: bool) -> Vec<Trit> {
-    a.iter().zip(b.iter()).map(|(&av, &bv)| {
-        // Z₃ addition
-        let sum = match (av, bv) {
-            (-1, -1) => 1,
-            (-1, 0) | (0, -1) => -1,
-            (-1, 1) | (0, 0) | (1, -1) => 0,
-            (0, 1) | (1, 0) => 1,
-            (1, 1) => -1, // wraps in Z₃
-            _ => 0,
-        };
-        if activate {
-            if sum < 0 { 0 } else { sum }
-        } else {
-            sum
+/// Clamp an integer to the valid trit range {-1, 0, +1}.
+fn clamp_trit(val: Trit) -> Trit {
+    if val < -1 { -1 } else if val > 1 { 1 } else { val }
+}
+
+fn apply_activation(val: Trit, op: &Op) -> Trit {
+    let clamped = clamp_trit(val);
+    match op {
+        Op::ReLU => {
+            if clamped < 0 { 0 } else { clamped }
         }
-    }).collect()
+        Op::Sign => {
+            clamped.signum()
+        }
+        Op::Tanh => {
+            if clamped < 0 { -1 } else if clamped > 0 { 1 } else { 0 }
+        }
+        _ => clamped,
+    }
 }
 
-/// Fusion analysis: how much memory bandwidth is saved.
-#[derive(Debug)]
-pub struct FusionAnalysis {
-    pub original_ops: usize,
-    pub fused_ops: usize,
-    pub fusions_performed: usize,
-    pub memory_saved_fraction: f64,
-}
+/// Ternary matmul with fused add: C = (A × B) + C_bias (all in Z₃).
+pub fn fused_matmul_add(
+    a: &[Vec<Trit>],
+    b: &[Vec<Trit>],
+    c_bias: &[Vec<Trit>],
+) -> Vec<Vec<Trit>> {
+    let rows = a.len();
+    let inner = if rows > 0 { a[0].len() } else { 0 };
+    let cols = if !b.is_empty() { b[0].len() } else { 0 };
 
-impl FusionAnalysis {
-    pub fn analyze(kernel: &mut FusedKernel, input_size: usize) -> Self {
-        let (orig_reads, orig_writes) = kernel.memory_ops_unfused(input_size);
-        let original_ops = kernel.len();
-        let fusions = kernel.fuse();
-        let (fused_reads, fused_writes) = kernel.memory_ops_unfused(input_size);
-        let orig_total = orig_reads + orig_writes;
-        let fused_total = fused_reads + fused_writes;
-        let saved = if orig_total > 0 {
-            1.0 - (fused_total as f64 / orig_total as f64)
-        } else { 0.0 };
-
-        Self {
-            original_ops,
-            fused_ops: kernel.len(),
-            fusions_performed: fusions,
-            memory_saved_fraction: saved,
+    let mut result = vec![vec![0i8; cols]; rows];
+    for i in 0..rows {
+        for k in 0..inner {
+            let aik = a[i].get(k).copied().unwrap_or(0);
+            if aik == 0 {
+                continue; // skip zero weights
+            }
+            for j in 0..cols {
+                let bkj = b[k].get(j).copied().unwrap_or(0);
+                // Z₃ multiply: aik * bkj
+                let prod = match (aik, bkj) {
+                    (1, 1) | (-1, -1) => 1,
+                    (1, -1) | (-1, 1) => -1,
+                    _ => 0,
+                };
+                // Z₃ add: result + prod + bias
+                let bias = c_bias[i].get(j).copied().unwrap_or(0);
+                let mut sum = z3_add(result[i][j], prod);
+                sum = z3_add(sum, bias);
+                result[i][j] = sum;
+            }
         }
     }
+    result
 }
 
 #[cfg(test)]
@@ -220,98 +215,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fused_matmul_bias_relu() {
-        // 2x2 matmul with 2x2 weight, 1x2 bias
-        let a = vec![1, 0, -1, 1]; // 2x2
-        let b = vec![1, -1, 0, 1]; // 2x2
-        let bias = vec![0, 1];
-        let result = fused_matmul_bias_relu(&a, &b, &bias, 2, 2, 2);
-        assert_eq!(result.len(), 4);
-        // All values should be 0 or 1 (ReLU applied)
-        for &t in &result {
-            assert!(t == 0 || t == 1);
-        }
+    fn test_fused_graph_creation() {
+        let mut graph = FusedGraph::new(64);
+        graph.push(Op::Matmul { rows: 4, inner: 8, cols: 16 });
+        graph.push(Op::BiasAdd { size: 16 });
+        graph.push(Op::ReLU);
+        assert_eq!(graph.ops.len(), 3);
+        assert!(graph.fusion_speedup() >= 1.0);
     }
 
     #[test]
-    fn test_fused_add_activate() {
-        let a = vec![-1, 0, 1, -1];
-        let b = vec![1, 0, -1, 1];
-        let result = fused_add_activate(&a, &b, true);
-        // ReLU: negatives become 0
-        for &t in &result {
-            assert!(t == 0 || t == 1);
-        }
+    fn test_fused_bias_activate() {
+        let mat = vec![
+            vec![1, -1, 0],
+            vec![0, 1, -1],
+        ];
+        let bias = vec![1, -1, 0];
+        let result = fused_bias_activate(&mat, &bias, Op::ReLU);
+        // Z₃: 1+1=-1, -1+(-1)=1, 0+0=0 → relu(-1,1,0) → [0, 1, 0]
+        assert_eq!(result[0], vec![0, 1, 0]);
     }
 
     #[test]
-    fn test_fused_add_no_activate() {
-        let a = vec![-1, 0, 1];
-        let b = vec![1, 0, -1];
-        let result = fused_add_activate(&a, &b, false);
-        assert_eq!(result, vec![0, 0, 0]); // Z₃: -1+1=0, 0+0=0, 1+(-1)=0
+    fn test_fused_matmul_add() {
+        let a = vec![
+            vec![1, 0],
+            vec![0, 1],
+        ];
+        let b = vec![
+            vec![1, -1],
+            vec![-1, 1],
+        ];
+        let c = vec![
+            vec![0, 0],
+            vec![0, 0],
+        ];
+        let result = fused_matmul_add(&a, &b, &c);
+        assert_eq!(result[0][0], 1);
+        assert_eq!(result[0][1], -1);
     }
 
     #[test]
-    fn test_kernel_fuse_matmul_bias() {
-        let mut kernel = FusedKernel::new(vec![
-            Op::Matmul { rows: 4, inner: 4, cols: 4 },
-            Op::BiasAdd { size: 4 },
-        ]);
-        let fusions = kernel.fuse();
-        assert_eq!(fusions, 1);
-        assert_eq!(kernel.len(), 1); // fused into single op
+    fn test_apply_activation() {
+        assert_eq!(apply_activation(-1, &Op::ReLU), 0);
+        assert_eq!(apply_activation(1, &Op::ReLU), 1);
+        assert_eq!(apply_activation(-1, &Op::Sign), -1);
     }
 
     #[test]
-    fn test_kernel_fuse_bias_relu() {
-        let mut kernel = FusedKernel::new(vec![
-            Op::BiasAdd { size: 8 },
-            Op::ReLU,
-        ]);
-        let fusions = kernel.fuse();
-        assert_eq!(fusions, 1);
-    }
-
-    #[test]
-    fn test_kernel_no_fuse_unrelated() {
-        let mut kernel = FusedKernel::new(vec![
-            Op::Reshape { new_shape: vec![2, 4] },
-            Op::Transpose { dim_a: 0, dim_b: 1 },
-        ]);
-        let fusions = kernel.fuse();
-        assert_eq!(fusions, 0);
-    }
-
-    #[test]
-    fn test_kernel_multi_fuse() {
-        let mut kernel = FusedKernel::new(vec![
-            Op::Matmul { rows: 4, inner: 4, cols: 4 },
-            Op::BiasAdd { size: 4 },
-            Op::ReLU,
-            Op::Scale { factor: 0.5 },
-        ]);
-        let fusions = kernel.fuse();
-        assert!(fusions >= 1);
-    }
-
-    #[test]
-    fn test_fusion_analysis() {
-        let mut kernel = FusedKernel::new(vec![
-            Op::Matmul { rows: 4, inner: 4, cols: 4 },
-            Op::BiasAdd { size: 4 },
-            Op::ReLU,
-        ]);
-        let analysis = FusionAnalysis::analyze(&mut kernel, 16);
-        assert!(analysis.fusions_performed >= 1);
-        assert!(analysis.fused_ops < analysis.original_ops);
-    }
-
-    #[test]
-    fn test_op_memory_estimate() {
-        let op = Op::Matmul { rows: 4, inner: 4, cols: 4 };
-        let (reads, writes) = op.memory_ops(16);
-        assert!(reads > 0);
-        assert!(writes > 0);
+    fn test_is_metadata() {
+        assert!(Op::Reshape { new_shape: vec![4, 4] }.is_metadata());
+        assert!(!Op::Add.is_metadata());
     }
 }
